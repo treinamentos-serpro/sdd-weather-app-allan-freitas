@@ -67,7 +67,10 @@ sobrescrevam uma busca mais recente.
 
 Não haverá backend, banco de dados, autenticação, analytics ou service worker no
 MVP, pois esses itens estão fora do escopo ou seriam over-engineering para a
-primeira versão.
+primeira versão. A hospedação de produção deve servir a aplicação
+exclusivamente via HTTPS, conforme requisito não funcional de segurança da
+spec; a escolha do provedor de hospedagem fica fora do escopo deste plano de
+arquitetura client-side.
 
 ## Project Structure
 
@@ -213,11 +216,14 @@ Fluxo de sugestões:
 
 1. Usuário digita no campo de busca.
 2. Entrada é trimada e validada entre 2 e 80 caracteres.
-3. Após 2 caracteres, o hook solicita sugestões ao service de geocoding.
-4. Cada nova consulta cancela ou invalida a anterior via `AbortController` ou
-   identificador incremental.
-5. A UI exibe até cinco sugestões com cidade, país e região quando disponível.
-6. Nenhum resultado gera estado específico de vazio, sem tentar tratar texto
+3. O hook aplica debounce de 300 ms antes de consultar o service de geocoding,
+   atendendo ao requisito de limitar consultas repetitivas no cliente.
+4. Após 2 caracteres e o debounce expirar, o hook solicita sugestões ao service
+   de geocoding.
+5. Cada nova consulta cancela a anterior via `AbortController`, garantindo que
+   uma resposta obsoleta não substitua sugestões mais recentes.
+6. A UI exibe até cinco sugestões com cidade, país e região quando disponível.
+7. Nenhum resultado gera estado específico de vazio, sem tentar tratar texto
    livre como coordenada.
 
 Fluxo de previsão:
@@ -257,16 +263,40 @@ Parâmetros previstos:
 - `language=pt`: preferir nomes/localização em português quando disponível.
 - `format=json`: formato da resposta.
 
-Campos relevantes da resposta:
+Exemplo resumido de resposta:
 
-- `id`
-- `name`
-- `country`
-- `country_code`
-- `admin1`
-- `latitude`
-- `longitude`
-- `timezone`
+```json
+{
+  "results": [
+    {
+      "id": 3451190,
+      "name": "São Paulo",
+      "latitude": -23.5475,
+      "longitude": -46.63611,
+      "country": "Brasil",
+      "country_code": "BR",
+      "admin1": "São Paulo",
+      "timezone": "America/Sao_Paulo"
+    }
+  ]
+}
+```
+
+Quando não há cidades compatíveis, a Open-Meteo pode omitir a chave
+`results` por completo; o service deve tratar esse caso como lista vazia, não
+como erro.
+
+Mapeamento para `CitySuggestion`:
+
+| Campo da resposta | Campo em `CitySuggestion` | Observação |
+| --- | --- | --- |
+| `id` | `id` | usado como key estável na lista de sugestões |
+| `name` | `name` | grafia oficial preservada, sem alteração de case |
+| `country` | `country` | |
+| `country_code` | `countryCode` | opcional |
+| `admin1` | `region` | opcional; ausente para países sem divisão administrativa relevante |
+| `latitude`, `longitude` | `latitude`, `longitude` | reenviados no forecast |
+| `timezone` | `timezone` | reenviado como parâmetro `timezone` do forecast |
 
 ### Open-Meteo Forecast API
 
@@ -282,19 +312,86 @@ Parâmetros previstos:
 - `timezone`: timezone da cidade quando disponível, ou `auto` como fallback
   controlado.
 - `forecast_days=5`: hoje e quatro dias seguintes.
-- `current`: temperatura, sensação térmica, precipitação, umidade, vento,
-  direção do vento, código climático e índice UV quando suportado.
-- `daily`: mínima, máxima, código climático, probabilidade de precipitação,
-  precipitação acumulada, nascer e pôr do sol.
+- `current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_direction_10m,uv_index`.
+- `daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,sunrise,sunset`.
 - `wind_speed_unit=kmh`: vento em km/h.
 - `temperature_unit=celsius`: base única para normalização e conversão local.
 - `precipitation_unit=mm`: precipitação em milímetros.
 
+Exemplo resumido de resposta:
+
+```json
+{
+  "latitude": -23.5475,
+  "longitude": -46.63611,
+  "timezone": "America/Sao_Paulo",
+  "current": {
+    "time": "2026-09-02T14:00",
+    "temperature_2m": 22.4,
+    "apparent_temperature": 21.8,
+    "relative_humidity_2m": 63,
+    "precipitation": 0.2,
+    "weather_code": 61,
+    "wind_speed_10m": 14.6,
+    "wind_direction_10m": 135,
+    "uv_index": 5.2
+  },
+  "daily": {
+    "time": ["2026-09-02", "2026-09-03", "2026-09-04", "2026-09-05", "2026-09-06"],
+    "weather_code": [61, 3, 2, 1, 0],
+    "temperature_2m_max": [24.1, 23.5, 25.0, 26.2, 27.0],
+    "temperature_2m_min": [16.3, 15.8, 16.9, 17.4, 18.0],
+    "precipitation_sum": [4.2, 0, 0, 0, 0],
+    "precipitation_probability_max": [70, 20, 10, 5, 0],
+    "sunrise": ["2026-09-02T06:12", "2026-09-03T06:12", "2026-09-04T06:13", "2026-09-05T06:13", "2026-09-06T06:14"],
+    "sunset": ["2026-09-02T17:48", "2026-09-03T17:47", "2026-09-04T17:47", "2026-09-05T17:46", "2026-09-06T17:46"]
+  }
+}
+```
+
+Mapeamento para `CurrentWeather` (bloco `current`):
+
+| Campo da resposta | Campo em `CurrentWeather` | Observação |
+| --- | --- | --- |
+| `time` | `measuredAtLocal` | já vem no timezone solicitado |
+| `temperature_2m` | `temperatureCelsius` | |
+| `apparent_temperature` | `apparentTemperatureCelsius` | |
+| `weather_code` | `condition` | mapeado via `utils/weatherCode.ts` para `label` + `iconAlt` |
+| `precipitation` | `precipitationLast24hMm` | aproximação: representa a precipitação da hora atual, não um acumulado de 24h real; ver observação abaixo |
+| `relative_humidity_2m` | `humidityPercent` | |
+| `wind_speed_10m` | `windDirectionCardinal`… | ver linha seguinte |
+| `wind_direction_10m` | `windDirectionDegrees` | `windDirectionCardinal` é derivado em `utils/wind.ts`, não vem da API |
+| `wind_speed_10m` | `windSpeedKmh` | |
+| `uv_index` | `uvIndex` | ausente em algumas execuções; mapear como `null` quando não vier |
+
+Mapeamento para `DailyForecast` (bloco `daily`, arrays por índice `i` de 0 a 4):
+
+| Campo da resposta | Campo em `DailyForecast` | Observação |
+| --- | --- | --- |
+| `time[i]` | `dateLocal` | |
+| `temperature_2m_min[i]` | `minTemperatureCelsius` | arredondar para 1 casa decimal na exibição |
+| `temperature_2m_max[i]` | `maxTemperatureCelsius` | arredondar para 1 casa decimal na exibição |
+| `weather_code[i]` | `condition` | mesmo mapeamento de `utils/weatherCode.ts` do clima atual |
+| `precipitation_probability_max[i]` | `rainProbabilityPercent` | |
+| `precipitation_sum[i]` | `precipitationMm` | |
+| `sunrise[i]` | `sunriseLocal` | |
+| `sunset[i]` | `sunsetLocal` | |
+
+Campos de nível superior da resposta (`latitude`, `longitude`, `timezone`) alimentam
+`WeatherReport.timezone`; `WeatherReport.source` é a constante `'Open-Meteo'` e
+`WeatherReport.fetchedAt` é o timestamp local do momento em que a resposta foi
+recebida pelo cliente, não um campo da API.
+
 Observações:
 
-- A disponibilidade exata de alguns campos atuais, como UV e precipitação nas
-  últimas 24 horas, deve ser validada operacionalmente contra a Open-Meteo antes
-  do lançamento.
+- A precipitação das últimas 24 horas exigida por FR-05 não corresponde
+  diretamente a `current.precipitation` (que é apenas a hora atual). Para o
+  MVP, o adaptador usará esse valor como aproximação e o rótulo da UI deixará
+  claro o período coberto; uma alternativa mais precisa (somar 24 valores de
+  `hourly.precipitation`) fica registrada como risco a validar antes do
+  lançamento.
+- `uv_index` pode não estar disponível para todos os locais ou horários; o
+  adaptador deve mapear a ausência como `null`, exibido como “Não disponível”.
 - Caso um campo opcional não venha na resposta, o adaptador deve preservar os
   demais dados e marcar o campo como indisponível.
 - Rate limiting, timeout, erro HTTP e JSON inválido serão normalizados em erros
@@ -314,7 +411,8 @@ Estados previstos:
 - `status`: estado discriminado da tela.
 - `error`: erro normalizado, quando houver.
 - `isShowingCache`: indica que a previsão exibida veio do cache.
-- `lastRequestId` ou `AbortController`: proteção contra respostas obsoletas.
+- `AbortController` ativo: cancela sugestões e forecast obsoletos ao iniciar
+  uma nova consulta, evitando respostas antigas sobrescreverem dados recentes.
 
 Persistência local:
 
@@ -329,6 +427,9 @@ Decisões:
   simples e testáveis.
 - A previsão anterior permanece visível até que a nova previsão seja validada,
   conforme FR-12.
+- A busca de sugestões usa debounce de 300 ms como único mecanismo de limite de
+  consultas repetitivas no cliente; não há necessidade de um limitador mais
+  sofisticado para o volume de tráfego esperado do MVP.
 
 ## Error Handling
 
@@ -336,13 +437,18 @@ Estratégia geral:
 
 - Validar entrada antes de chamar APIs: vazio, menos de 2 caracteres ou mais de
   80 caracteres geram `invalid-input`.
-- Aplicar timeout de 10 segundos em geocoding e forecast.
+- Aplicar timeout de 10 segundos em geocoding e forecast, medido separadamente
+  do tempo de renderização da UI, para acompanhar os orçamentos de LCP e de
+  atualização em até 200 ms definidos nos requisitos não funcionais.
 - Cancelar ou ignorar respostas antigas quando uma nova consulta começar.
 - Normalizar falhas em categorias exibíveis: rede, timeout, rate limiting,
   resposta inválida, nenhum resultado e cache.
 - Oferecer “Tentar novamente” quando houver cidade selecionada ou consulta
   repetível.
 - Preservar dados válidos existentes até que uma nova previsão seja confirmada.
+- Registrar erros relevantes (rede, timeout, resposta inválida) via
+  `console.error` com contexto mínimo (cidade, categoria do erro, status),
+  sem dados sensíveis; o MVP não terá serviço externo de log.
 
 Fallback por cache:
 
@@ -364,6 +470,8 @@ Mensagens e acessibilidade:
 
 Testes unitários com Vitest + Testing Library:
 
+- Fazer mock da camada de `services/` em todos os testes de hooks e
+  componentes; nenhum teste unitário chama a Open-Meteo real.
 - Validação do input: trim, limites 2-80 e caracteres especiais.
 - Conversão Celsius/Fahrenheit com uma casa decimal.
 - Mapeamento de direção do vento em graus para ponto cardeal.
@@ -377,6 +485,8 @@ Testes unitários com Vitest + Testing Library:
 
 Testes E2E com Playwright:
 
+- Interceptar chamadas de rede com `page.route` em todos os cenários, para
+  resultados determinísticos sem depender da Open-Meteo real.
 - Buscar cidade válida, selecionar sugestão e ver clima atual + cinco dias.
 - Cidade homônima exibindo cidade, país e região.
 - Entrada inválida não dispara consulta e mostra validação.
@@ -385,6 +495,8 @@ Testes E2E com Playwright:
 - Falha de rede com cache válido exibe última previsão e idade do cache.
 - Falha de rede sem cache exibe erro e botão “Tentar novamente”.
 - Viewports 320, 360, 768 e 1440 px sem overflow horizontal nem sobreposição.
+- Executar ao menos os fluxos críticos nos projetos Chromium, Firefox e WebKit
+  do Playwright, cobrindo a matriz de navegadores exigida pela spec.
 
 Validações finais antes de concluir tarefas:
 
