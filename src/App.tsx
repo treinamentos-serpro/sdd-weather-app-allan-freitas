@@ -20,7 +20,10 @@ export default function App() {
       case 'error':
         return (
           <ErrorState
-            message={error ?? 'Não foi possível carregar a previsão. Verifique sua conexão e tente novamente.'}
+            message={
+              error ??
+              'Não foi possível carregar a previsão. Verifique sua conexão e tente novamente.'
+            }
             onRetry={retry}
           />
         );
